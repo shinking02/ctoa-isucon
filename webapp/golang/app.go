@@ -173,42 +173,132 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 
 func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, error) {
 	var posts []Post
+	
+	if len(results) == 0 {
+		return posts, nil
+	}
 
+	// 投稿IDを収集
+	postIDs := make([]int, len(results))
+	for i, p := range results {
+		postIDs[i] = p.ID
+	}
+
+	// プレースホルダーを作成
+	placeholders := make([]string, len(postIDs))
+	args := make([]interface{}, len(postIDs))
+	for i, id := range postIDs {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	placeholderStr := strings.Join(placeholders, ", ")
+
+	// コメント数を一括取得
+	commentCounts := make(map[int]int)
+	commentCountQuery := fmt.Sprintf("SELECT post_id, COUNT(*) as count FROM comments WHERE post_id IN (%s) GROUP BY post_id", placeholderStr)
+	rows, err := db.Query(commentCountQuery, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	
+	for rows.Next() {
+		var postID, count int
+		if err := rows.Scan(&postID, &count); err != nil {
+			return nil, err
+		}
+		commentCounts[postID] = count
+	}
+
+	// コメントを一括取得（JOINでユーザー情報も取得）
+	commentsMap := make(map[int][]Comment)
+	commentQuery := fmt.Sprintf(`
+		SELECT c.id, c.post_id, c.user_id, c.comment, c.created_at,
+		       u.id, u.account_name, u.passhash, u.authority, u.del_flg, u.created_at
+		FROM comments c 
+		JOIN users u ON c.user_id = u.id 
+		WHERE c.post_id IN (%s) 
+		ORDER BY c.post_id, c.created_at DESC`, placeholderStr)
+	
+	commentRows, err := db.Query(commentQuery, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer commentRows.Close()
+	
+	for commentRows.Next() {
+		var comment Comment
+		var user User
+		err := commentRows.Scan(
+			&comment.ID, &comment.PostID, &comment.UserID, &comment.Comment, &comment.CreatedAt,
+			&user.ID, &user.AccountName, &user.Passhash, &user.Authority, &user.DelFlg, &user.CreatedAt,
+		)
+		if err != nil {
+			return nil, err
+		}
+		comment.User = user
+		commentsMap[comment.PostID] = append(commentsMap[comment.PostID], comment)
+	}
+
+	// 投稿のユーザー情報を一括取得
+	userIDs := make([]int, len(results))
+	for i, p := range results {
+		userIDs[i] = p.UserID
+	}
+	
+	// 重複を除去
+	userIDSet := make(map[int]bool)
+	uniqueUserIDs := []int{}
+	for _, id := range userIDs {
+		if !userIDSet[id] {
+			userIDSet[id] = true
+			uniqueUserIDs = append(uniqueUserIDs, id)
+		}
+	}
+	
+	userPlaceholders := make([]string, len(uniqueUserIDs))
+	userArgs := make([]interface{}, len(uniqueUserIDs))
+	for i, id := range uniqueUserIDs {
+		userPlaceholders[i] = "?"
+		userArgs[i] = id
+	}
+	userPlaceholderStr := strings.Join(userPlaceholders, ", ")
+	
+	usersMap := make(map[int]User)
+	userQuery := fmt.Sprintf("SELECT id, account_name, passhash, authority, del_flg, created_at FROM users WHERE id IN (%s)", userPlaceholderStr)
+	userRows, err := db.Query(userQuery, userArgs...)
+	if err != nil {
+		return nil, err
+	}
+	defer userRows.Close()
+	
+	for userRows.Next() {
+		var user User
+		err := userRows.Scan(&user.ID, &user.AccountName, &user.Passhash, &user.Authority, &user.DelFlg, &user.CreatedAt)
+		if err != nil {
+			return nil, err
+		}
+		usersMap[user.ID] = user
+	}
+
+	// 投稿データを組み立て
 	for _, p := range results {
-		err := db.Get(&p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
-		if err != nil {
-			return nil, err
+		p.CommentCount = commentCounts[p.ID]
+		
+		// コメントを設定（制限あり/なし）
+		comments := commentsMap[p.ID]
+		if !allComments && len(comments) > 3 {
+			comments = comments[:3]
 		}
-
-		query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
-		if !allComments {
-			query += " LIMIT 3"
-		}
-		var comments []Comment
-		err = db.Select(&comments, query, p.ID)
-		if err != nil {
-			return nil, err
-		}
-
-		for i := 0; i < len(comments); i++ {
-			err := db.Get(&comments[i].User, "SELECT * FROM `users` WHERE `id` = ?", comments[i].UserID)
-			if err != nil {
-				return nil, err
-			}
-		}
-
-		// reverse
+		
+		// コメントの順序を逆転（古い順にする）
 		for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
 			comments[i], comments[j] = comments[j], comments[i]
 		}
-
 		p.Comments = comments
-
-		err = db.Get(&p.User, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
-		if err != nil {
-			return nil, err
-		}
-
+		
+		// ユーザー情報を設定
+		p.User = usersMap[p.UserID]
 		p.CSRFToken = csrfToken
 
 		if p.User.DelFlg == 0 {
@@ -444,40 +534,24 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	commentCount := 0
-	err = db.Get(&commentCount, "SELECT COUNT(*) AS count FROM `comments` WHERE `user_id` = ?", user.ID)
+	// 統計情報を一度のクエリで取得
+	var stats struct {
+		CommentCount   int `db:"comment_count"`
+		PostCount      int `db:"post_count"`
+		CommentedCount int `db:"commented_count"`
+	}
+	
+	statsQuery := `
+		SELECT 
+			(SELECT COUNT(*) FROM comments WHERE user_id = ?) as comment_count,
+			(SELECT COUNT(*) FROM posts WHERE user_id = ?) as post_count,
+			(SELECT COUNT(*) FROM comments WHERE post_id IN (SELECT id FROM posts WHERE user_id = ?)) as commented_count
+	`
+	
+	err = db.Get(&stats, statsQuery, user.ID, user.ID, user.ID)
 	if err != nil {
 		log.Print(err)
 		return
-	}
-
-	postIDs := []int{}
-	err = db.Select(&postIDs, "SELECT `id` FROM `posts` WHERE `user_id` = ?", user.ID)
-	if err != nil {
-		log.Print(err)
-		return
-	}
-	postCount := len(postIDs)
-
-	commentedCount := 0
-	if postCount > 0 {
-		s := []string{}
-		for range postIDs {
-			s = append(s, "?")
-		}
-		placeholder := strings.Join(s, ", ")
-
-		// convert []int -> []interface{}
-		args := make([]interface{}, len(postIDs))
-		for i, v := range postIDs {
-			args[i] = v
-		}
-
-		err = db.Get(&commentedCount, "SELECT COUNT(*) AS count FROM `comments` WHERE `post_id` IN ("+placeholder+")", args...)
-		if err != nil {
-			log.Print(err)
-			return
-		}
 	}
 
 	me := getSessionUser(r)
@@ -498,7 +572,7 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 		CommentCount   int
 		CommentedCount int
 		Me             User
-	}{posts, user, postCount, commentCount, commentedCount, me})
+	}{posts, user, stats.PostCount, stats.CommentCount, stats.CommentedCount, me})
 }
 
 func getPosts(w http.ResponseWriter, r *http.Request) {
@@ -679,7 +753,7 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	post := Post{}
-	err = db.Get(&post, "SELECT * FROM `posts` WHERE `id` = ?", pid)
+	err = db.Get(&post, "SELECT mime, imgdata FROM `posts` WHERE `id` = ?", pid)
 	if err != nil {
 		log.Print(err)
 		return
@@ -743,7 +817,7 @@ func getAdminBanned(w http.ResponseWriter, r *http.Request) {
 	}
 
 	users := []User{}
-	err := db.Select(&users, "SELECT * FROM `users` WHERE `authority` = 0 AND `del_flg` = 0 ORDER BY `created_at` DESC")
+	err := db.Select(&users, "SELECT id, account_name, authority, del_flg, created_at FROM `users` WHERE `authority` = 0 AND `del_flg` = 0 ORDER BY `created_at` DESC")
 	if err != nil {
 		log.Print(err)
 		return
