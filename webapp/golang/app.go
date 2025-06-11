@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -1212,30 +1213,65 @@ func imageFileExists(postID int, mime string) bool {
 
 // 既存の画像データをファイルシステムに移行
 func migrateImagesToFileSystem() {
-	log.Println("Migrating images to file system...")
+	log.Println("Starting image migration to file system...")
 	
-	// すべての画像データを取得（LIMITを削除）
-	posts := []Post{}
-	err := db.Select(&posts, "SELECT id, mime, imgdata FROM posts WHERE imgdata IS NOT NULL")
+	// 現在の作業ディレクトリを確認
+	wd, err := os.Getwd()
 	if err != nil {
-		log.Print("Failed to select posts for migration:", err)
+		log.Printf("Failed to get working directory: %v", err)
+	} else {
+		log.Printf("Current working directory: %s", wd)
+	}
+	
+	// ディレクトリの存在確認と作成
+	dir := "../public/images"
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		log.Printf("Failed to get absolute path for %s: %v", dir, err)
+	} else {
+		log.Printf("Image directory absolute path: %s", absDir)
+	}
+	
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		log.Printf("Failed to create directory %s: %v", dir, err)
+		return
+	}
+	
+	// DB接続を確認
+	if err := db.Ping(); err != nil {
+		log.Printf("Database connection failed: %v", err)
+		return
+	}
+	
+	// すべての画像データを取得
+	posts := []Post{}
+	err = db.Select(&posts, "SELECT id, mime, imgdata FROM posts WHERE imgdata IS NOT NULL LIMIT 10") // デバッグ用に制限
+	if err != nil {
+		log.Printf("Failed to select posts for migration: %v", err)
 		return
 	}
 
 	log.Printf("Found %d posts with image data to migrate", len(posts))
 	
+	if len(posts) == 0 {
+		log.Println("No posts with image data found")
+		return
+	}
+	
 	migrated := 0
 	for _, post := range posts {
+		log.Printf("Processing post %d with mime %s, data size: %d bytes", post.ID, post.Mime, len(post.Imgdata))
+		
 		if !imageFileExists(post.ID, post.Mime) {
 			err := saveImageToFile(post.ID, post.Mime, post.Imgdata)
 			if err != nil {
 				log.Printf("Failed to migrate image for post %d: %v", post.ID, err)
 			} else {
 				migrated++
-				if migrated%100 == 0 {
-					log.Printf("Migrated %d images so far...", migrated)
-				}
+				log.Printf("Successfully migrated image for post %d", post.ID)
 			}
+		} else {
+			log.Printf("Image file already exists for post %d", post.ID)
 		}
 	}
 	
@@ -1285,8 +1321,14 @@ func main() {
 	db.SetMaxIdleConns(25)
 	db.SetConnMaxLifetime(5 * time.Minute)
 
-	// 既存の画像をファイルシステムに移行（起動時に一度だけ実行）
-	go migrateImagesToFileSystem()
+	// DB接続を確認
+	if err := db.Ping(); err != nil {
+		log.Fatalf("Database ping failed: %s", err.Error())
+	}
+	log.Println("Database connection established")
+
+	// 既存の画像をファイルシステムに移行（同期実行でデバッグ）
+	migrateImagesToFileSystem()
 
 	r := chi.NewRouter()
 
