@@ -206,8 +206,8 @@ func getCachedIndexPosts() ([]Post, bool) {
 		return nil, false
 	}
 	
-	// 5分以内のキャッシュのみ有効
-	if time.Since(cached.CachedAt) > 5*time.Minute {
+	// 10分以内のキャッシュのみ有効
+	if time.Since(cached.CachedAt) > 10*time.Minute {
 		return nil, false
 	}
 	
@@ -225,7 +225,7 @@ func setCachedIndexPosts(posts []Post) {
 		memcacheClient.Set(&memcache.Item{
 			Key:        key,
 			Value:      data,
-			Expiration: 300, // 5分
+			Expiration: 600, // 10分に延長
 		})
 	}
 }
@@ -680,8 +680,7 @@ func getLogout(w http.ResponseWriter, r *http.Request) {
 func getIndex(w http.ResponseWriter, r *http.Request) {
 	me := getSessionUser(r)
 
-	// 一時的にキャッシュを無効化してテスト
-	/*
+	// キャッシュから投稿を取得を試みる
 	if cachedPosts, found := getCachedIndexPosts(); found {
 		fmap := template.FuncMap{
 			"imageURL": imageURL,
@@ -710,7 +709,6 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	*/
 
 	results := []Post{}
 
@@ -1037,41 +1035,12 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 
 	ext := r.PathValue("ext")
 	
-	// ファイルシステムから画像を読み込み
+	// ファイルシステムから画像を読み込み（DBアクセスを完全に削除）
 	filename := fmt.Sprintf("../public/images/%d.%s", pid, ext)
 	imageData, err := os.ReadFile(filename)
 	if err != nil {
-		// ファイルが存在しない場合はDBから取得してファイルに保存
-		post := Post{}
-		err = db.Get(&post, "SELECT mime, imgdata FROM `posts` WHERE `id` = ?", pid)
-		if err != nil {
-			log.Printf("Failed to get image data from DB for post %d: %v", pid, err)
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-
-		// imgdataがnullの場合
-		if post.Imgdata == nil || len(post.Imgdata) == 0 {
-			log.Printf("No image data found for post %d", pid)
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-
-		// 拡張子とMIMEタイプの整合性をチェック
-		if !(ext == "jpg" && post.Mime == "image/jpeg" ||
-			ext == "png" && post.Mime == "image/png" ||
-			ext == "gif" && post.Mime == "image/gif") {
-			log.Printf("MIME type mismatch for post %d: ext=%s, mime=%s", pid, ext, post.Mime)
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-
-		// ファイルシステムに保存
-		err = saveImageToFile(pid, post.Mime, post.Imgdata)
-		if err != nil {
-			log.Printf("Failed to save image file for post %d: %v", pid, err)
-		}
-		imageData = post.Imgdata
+		w.WriteHeader(http.StatusNotFound)
+		return
 	}
 
 	// Content-Typeを設定
