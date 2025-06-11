@@ -148,12 +148,22 @@ func getSessionUser(r *http.Request) User {
 		return User{}
 	}
 
-	u := User{}
+	// セッションからユーザー情報を取得を試みる
+	if cachedUser, ok := session.Values["user_cache"]; ok {
+		if user, ok := cachedUser.(User); ok && user.ID == uid {
+			return user
+		}
+	}
 
+	u := User{}
 	err := db.Get(&u, "SELECT * FROM `users` WHERE `id` = ?", uid)
 	if err != nil {
 		return User{}
 	}
+
+	// セッションにユーザー情報をキャッシュ
+	session.Values["user_cache"] = u
+	session.Save(r, nil)
 
 	return u
 }
@@ -383,6 +393,7 @@ func postLogin(w http.ResponseWriter, r *http.Request) {
 	if u != nil {
 		session := getSession(r)
 		session.Values["user_id"] = u.ID
+		session.Values["user_cache"] = *u
 		session.Values["csrf_token"] = secureRandomStr(16)
 		session.Save(r, w)
 
@@ -455,7 +466,19 @@ func postRegister(w http.ResponseWriter, r *http.Request) {
 		log.Print(err)
 		return
 	}
+	
+	// 新しく作成されたユーザーをキャッシュ
+	newUser := User{
+		ID:          int(uid),
+		AccountName: accountName,
+		Passhash:    calculatePasshash(accountName, password),
+		Authority:   0,
+		DelFlg:      0,
+		CreatedAt:   time.Now(),
+	}
+	
 	session.Values["user_id"] = uid
+	session.Values["user_cache"] = newUser
 	session.Values["csrf_token"] = secureRandomStr(16)
 	session.Save(r, w)
 
@@ -465,6 +488,7 @@ func postRegister(w http.ResponseWriter, r *http.Request) {
 func getLogout(w http.ResponseWriter, r *http.Request) {
 	session := getSession(r)
 	delete(session.Values, "user_id")
+	delete(session.Values, "user_cache")
 	session.Options = &sessions.Options{MaxAge: -1}
 	session.Save(r, w)
 
@@ -476,7 +500,7 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 
-	err := db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC")
+	err := db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC LIMIT ?", postsPerPage)
 	if err != nil {
 		log.Print(err)
 		return
@@ -522,7 +546,7 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 
-	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC", user.ID)
+	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC LIMIT ?", user.ID, postsPerPage)
 	if err != nil {
 		log.Print(err)
 		return
@@ -594,7 +618,7 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := []Post{}
-	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC", t.Format(ISO8601Format))
+	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC LIMIT ?", t.Format(ISO8601Format), postsPerPage)
 	if err != nil {
 		log.Print(err)
 		return
@@ -902,6 +926,11 @@ func main() {
 		log.Fatalf("Failed to connect to DB: %s.", err.Error())
 	}
 	defer db.Close()
+
+	// データベース接続プールの設定
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(25)
+	db.SetConnMaxLifetime(5 * time.Minute)
 
 	r := chi.NewRouter()
 
