@@ -169,11 +169,18 @@ def make_posts(results, all_comments=False):
 # app setup
 static_path = pathlib.Path(__file__).resolve().parent.parent / "public"
 app = flask.Flask(__name__, static_folder=str(static_path), static_url_path="")
+app.secret_key = os.environ.get(
+    "FLASK_SECRET_KEY", "isucon_secret_key_change_in_production"
+)
 # app.debug = True
 
 # Flask-Session
 app.config["SESSION_TYPE"] = "memcached"
 app.config["SESSION_MEMCACHED"] = memcache()
+app.config["SESSION_PERMANENT"] = False
+app.config["SESSION_USE_SIGNER"] = True
+app.config["SESSION_KEY_PREFIX"] = "session:"
+app.config["SESSION_COOKIE_HTTPONLY"] = True
 Session(app)
 
 
@@ -310,22 +317,21 @@ def get_user_list(account_name):
     )
     posts = make_posts(cursor.fetchall())
 
+    # 統計情報を一括で取得してパフォーマンスを向上
     cursor.execute(
-        "SELECT COUNT(*) AS count FROM `comments` WHERE `user_id` = %s", (user["id"],)
+        """
+        SELECT 
+            (SELECT COUNT(*) FROM `comments` WHERE `user_id` = %s) AS comment_count,
+            (SELECT COUNT(*) FROM `posts` WHERE `user_id` = %s) AS post_count,
+            (SELECT COUNT(*) FROM `comments` WHERE `post_id` IN (SELECT `id` FROM `posts` WHERE `user_id` = %s)) AS commented_count
+        """,
+        (user["id"], user["id"], user["id"]),
     )
-    comment_count = cursor.fetchone()["count"]
+    stats = cursor.fetchone()
 
-    cursor.execute("SELECT `id` FROM `posts` WHERE `user_id` = %s", (user["id"],))
-    post_ids = [p["id"] for p in cursor]
-    post_count = len(post_ids)
-
-    commented_count = 0
-    if post_count > 0:
-        cursor.execute(
-            "SELECT COUNT(*) AS count FROM `comments` WHERE `post_id` IN %s",
-            (post_ids,),
-        )
-        commented_count = cursor.fetchone()["count"]
+    comment_count = stats["comment_count"]
+    post_count = stats["post_count"]
+    commented_count = stats["commented_count"]
 
     me = get_session_user()
 
