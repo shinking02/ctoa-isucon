@@ -1045,6 +1045,14 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 		post := Post{}
 		err = db.Get(&post, "SELECT mime, imgdata FROM `posts` WHERE `id` = ?", pid)
 		if err != nil {
+			log.Printf("Failed to get image data from DB for post %d: %v", pid, err)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+
+		// imgdataがnullの場合
+		if post.Imgdata == nil || len(post.Imgdata) == 0 {
+			log.Printf("No image data found for post %d", pid)
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
@@ -1053,12 +1061,16 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 		if !(ext == "jpg" && post.Mime == "image/jpeg" ||
 			ext == "png" && post.Mime == "image/png" ||
 			ext == "gif" && post.Mime == "image/gif") {
+			log.Printf("MIME type mismatch for post %d: ext=%s, mime=%s", pid, ext, post.Mime)
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
 
 		// ファイルシステムに保存
-		saveImageToFile(pid, post.Mime, post.Imgdata)
+		err = saveImageToFile(pid, post.Mime, post.Imgdata)
+		if err != nil {
+			log.Printf("Failed to save image file for post %d: %v", pid, err)
+		}
 		imageData = post.Imgdata
 	}
 
@@ -1204,7 +1216,13 @@ func saveImageToFile(postID int, mime string, data []byte) error {
 		ext = ".gif"
 	}
 
-	filename := fmt.Sprintf("../public/images/%d%s", postID, ext)
+	// ディレクトリが存在しない場合は作成
+	dir := "../public/images"
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+
+	filename := fmt.Sprintf("%s/%d%s", dir, postID, ext)
 	return os.WriteFile(filename, data, 0644)
 }
 
@@ -1227,13 +1245,16 @@ func imageFileExists(postID int, mime string) bool {
 func migrateImagesToFileSystem() {
 	log.Println("Migrating images to file system...")
 	
+	// すべての画像データを取得（LIMITを削除）
 	posts := []Post{}
-	err := db.Select(&posts, "SELECT id, mime, imgdata FROM posts WHERE imgdata IS NOT NULL LIMIT 1000")
+	err := db.Select(&posts, "SELECT id, mime, imgdata FROM posts WHERE imgdata IS NOT NULL")
 	if err != nil {
 		log.Print("Failed to select posts for migration:", err)
 		return
 	}
 
+	log.Printf("Found %d posts with image data to migrate", len(posts))
+	
 	migrated := 0
 	for _, post := range posts {
 		if !imageFileExists(post.ID, post.Mime) {
@@ -1242,11 +1263,14 @@ func migrateImagesToFileSystem() {
 				log.Printf("Failed to migrate image for post %d: %v", post.ID, err)
 			} else {
 				migrated++
+				if migrated%100 == 0 {
+					log.Printf("Migrated %d images so far...", migrated)
+				}
 			}
 		}
 	}
 	
-	log.Printf("Migrated %d images to file system", migrated)
+	log.Printf("Migration completed. Migrated %d images to file system", migrated)
 }
 
 func main() {
