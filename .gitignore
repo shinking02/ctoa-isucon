@@ -18,3 +18,4 @@ portal/tmp
 .vagrant
 
 /webapp/sql/dump.sql.bz2
+/webapp/public/images

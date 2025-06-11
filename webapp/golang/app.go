@@ -26,9 +26,9 @@ import (
 )
 
 var (
-	db        *sqlx.DB
-	store     *gsm.MemcacheStore
-	templates map[string]*template.Template
+	db             *sqlx.DB
+	store          *gsm.MemcacheStore
+	memcacheClient *memcache.Client
 )
 
 const (
@@ -93,6 +93,9 @@ func dbInitialize() {
 	
 	// データベース初期化時にすべてのキャッシュをクリア
 	memcacheClient.FlushAll()
+	
+	// 既存の画像をファイルシステムに移行
+	migrateImagesToFileSystem()
 }
 
 func tryLogin(accountName, password string) *User {
@@ -677,16 +680,37 @@ func getLogout(w http.ResponseWriter, r *http.Request) {
 func getIndex(w http.ResponseWriter, r *http.Request) {
 	me := getSessionUser(r)
 
-	// キャッシュから投稿を取得を試みる
+	// 一時的にキャッシュを無効化してテスト
+	/*
 	if cachedPosts, found := getCachedIndexPosts(); found {
-		templates["index"].Execute(w, struct {
+		fmap := template.FuncMap{
+			"imageURL": imageURL,
+		}
+
+		tmpl, err := template.New("layout.html").Funcs(fmap).ParseFiles(
+			getTemplPath("layout.html"),
+			getTemplPath("index.html"),
+			getTemplPath("posts.html"),
+			getTemplPath("post.html"),
+		)
+		if err != nil {
+			log.Print("Template parse error (cached):", err)
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			return
+		}
+		
+		err = tmpl.Execute(w, struct {
 			Posts     []Post
 			Me        User
 			CSRFToken string
 			Flash     string
 		}{cachedPosts, me, getCSRFToken(r), getFlash(w, r, "notice")})
+		if err != nil {
+			log.Print("Template execute error (cached):", err)
+		}
 		return
 	}
+	*/
 
 	results := []Post{}
 
@@ -709,17 +733,27 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 		"imageURL": imageURL,
 	}
 
-	template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
+	tmpl, err := template.New("layout.html").Funcs(fmap).ParseFiles(
 		getTemplPath("layout.html"),
 		getTemplPath("index.html"),
 		getTemplPath("posts.html"),
 		getTemplPath("post.html"),
-	)).Execute(w, struct {
+	)
+	if err != nil {
+		log.Print("Template parse error:", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+	
+	err = tmpl.Execute(w, struct {
 		Posts     []Post
 		Me        User
 		CSRFToken string
 		Flash     string
 	}{posts, me, getCSRFToken(r), getFlash(w, r, "notice")})
+	if err != nil {
+		log.Print("Template execute error:", err)
+	}
 }
 
 func getAccountName(w http.ResponseWriter, r *http.Request) {
@@ -861,7 +895,7 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := []Post{}
-	err = db.Select(&results, "SELECT * FROM `posts` WHERE `id` = ?", pid)
+	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `id` = ?", pid)
 	if err != nil {
 		log.Print(err)
 		return
@@ -953,12 +987,12 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	query := "INSERT INTO `posts` (`user_id`, `mime`, `imgdata`, `body`) VALUES (?,?,?,?)"
+	// 画像データなしでポストを作成
+	query := "INSERT INTO `posts` (`user_id`, `mime`, `body`) VALUES (?,?,?)"
 	result, err := db.Exec(
 		query,
 		me.ID,
 		mime,
-		filedata,
 		r.FormValue("body"),
 	)
 	if err != nil {
@@ -969,6 +1003,19 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 	pid, err := result.LastInsertId()
 	if err != nil {
 		log.Print(err)
+		return
+	}
+
+	// 画像をファイルシステムに保存
+	err = saveImageToFile(int(pid), mime, filedata)
+	if err != nil {
+		log.Print("Failed to save image file:", err)
+		// ファイル保存に失敗した場合は投稿を削除
+		db.Exec("DELETE FROM posts WHERE id = ?", pid)
+		session := getSession(r)
+		session.Values["notice"] = "画像の保存に失敗しました"
+		session.Save(r, w)
+		http.Redirect(w, r, "/", http.StatusFound)
 		return
 	}
 
@@ -988,28 +1035,54 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	post := Post{}
-	err = db.Get(&post, "SELECT mime, imgdata FROM `posts` WHERE `id` = ?", pid)
+	ext := r.PathValue("ext")
+	
+	// ファイルシステムから画像を読み込み
+	filename := fmt.Sprintf("../public/images/%d.%s", pid, ext)
+	imageData, err := os.ReadFile(filename)
+	if err != nil {
+		// ファイルが存在しない場合はDBから取得してファイルに保存
+		post := Post{}
+		err = db.Get(&post, "SELECT mime, imgdata FROM `posts` WHERE `id` = ?", pid)
+		if err != nil {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+
+		// 拡張子とMIMEタイプの整合性をチェック
+		if !(ext == "jpg" && post.Mime == "image/jpeg" ||
+			ext == "png" && post.Mime == "image/png" ||
+			ext == "gif" && post.Mime == "image/gif") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+
+		// ファイルシステムに保存
+		saveImageToFile(pid, post.Mime, post.Imgdata)
+		imageData = post.Imgdata
+	}
+
+	// Content-Typeを設定
+	mime := ""
+	switch ext {
+	case "jpg":
+		mime = "image/jpeg"
+	case "png":
+		mime = "image/png"
+	case "gif":
+		mime = "image/gif"
+	default:
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", mime)
+	w.Header().Set("Cache-Control", "public, max-age=86400") // 1日キャッシュ
+	_, err = w.Write(imageData)
 	if err != nil {
 		log.Print(err)
 		return
 	}
-
-	ext := r.PathValue("ext")
-
-	if ext == "jpg" && post.Mime == "image/jpeg" ||
-		ext == "png" && post.Mime == "image/png" ||
-		ext == "gif" && post.Mime == "image/gif" {
-		w.Header().Set("Content-Type", post.Mime)
-		_, err := w.Write(post.Imgdata)
-		if err != nil {
-			log.Print(err)
-			return
-		}
-		return
-	}
-
-	w.WriteHeader(http.StatusNotFound)
 }
 
 func postComment(w http.ResponseWriter, r *http.Request) {
@@ -1120,6 +1193,62 @@ func postAdminBanned(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/admin/banned", http.StatusFound)
 }
 
+// 画像保存用のヘルパー関数
+func saveImageToFile(postID int, mime string, data []byte) error {
+	ext := ""
+	if mime == "image/jpeg" {
+		ext = ".jpg"
+	} else if mime == "image/png" {
+		ext = ".png"
+	} else if mime == "image/gif" {
+		ext = ".gif"
+	}
+
+	filename := fmt.Sprintf("../public/images/%d%s", postID, ext)
+	return os.WriteFile(filename, data, 0644)
+}
+
+func imageFileExists(postID int, mime string) bool {
+	ext := ""
+	if mime == "image/jpeg" {
+		ext = ".jpg"
+	} else if mime == "image/png" {
+		ext = ".png"
+	} else if mime == "image/gif" {
+		ext = ".gif"
+	}
+
+	filename := fmt.Sprintf("../public/images/%d%s", postID, ext)
+	_, err := os.Stat(filename)
+	return err == nil
+}
+
+// 既存の画像データをファイルシステムに移行
+func migrateImagesToFileSystem() {
+	log.Println("Migrating images to file system...")
+	
+	posts := []Post{}
+	err := db.Select(&posts, "SELECT id, mime, imgdata FROM posts WHERE imgdata IS NOT NULL LIMIT 1000")
+	if err != nil {
+		log.Print("Failed to select posts for migration:", err)
+		return
+	}
+
+	migrated := 0
+	for _, post := range posts {
+		if !imageFileExists(post.ID, post.Mime) {
+			err := saveImageToFile(post.ID, post.Mime, post.Imgdata)
+			if err != nil {
+				log.Printf("Failed to migrate image for post %d: %v", post.ID, err)
+			} else {
+				migrated++
+			}
+		}
+	}
+	
+	log.Printf("Migrated %d images to file system", migrated)
+}
+
 func main() {
 	host := os.Getenv("ISUCONP_DB_HOST")
 	if host == "" {
@@ -1162,6 +1291,9 @@ func main() {
 	db.SetMaxOpenConns(25)
 	db.SetMaxIdleConns(25)
 	db.SetConnMaxLifetime(5 * time.Minute)
+
+	// 既存の画像をファイルシステムに移行（起動時に一度だけ実行）
+	go migrateImagesToFileSystem()
 
 	r := chi.NewRouter()
 
