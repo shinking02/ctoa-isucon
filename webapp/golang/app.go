@@ -2,6 +2,7 @@ package main
 
 import (
 	crand "crypto/rand"
+	"encoding/json"
 	"fmt"
 	"html/template"
 	"io"
@@ -25,8 +26,9 @@ import (
 )
 
 var (
-	db    *sqlx.DB
-	store *gsm.MemcacheStore
+	db        *sqlx.DB
+	store     *gsm.MemcacheStore
+	templates map[string]*template.Template
 )
 
 const (
@@ -71,7 +73,7 @@ func init() {
 	if memdAddr == "" {
 		memdAddr = "localhost:11211"
 	}
-	memcacheClient := memcache.New(memdAddr)
+	memcacheClient = memcache.New(memdAddr)
 	store = gsm.NewMemcacheStore(memcacheClient, "iscogram_", []byte("sendagaya"))
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
 }
@@ -88,6 +90,9 @@ func dbInitialize() {
 	for _, sql := range sqls {
 		db.Exec(sql)
 	}
+	
+	// データベース初期化時にすべてのキャッシュをクリア
+	memcacheClient.FlushAll()
 }
 
 func tryLogin(accountName, password string) *User {
@@ -135,6 +140,175 @@ func calculatePasshash(accountName, password string) string {
 	return digest(password + ":" + calculateSalt(accountName))
 }
 
+// キャッシュヘルパー関数
+func getCachedUser(userID int) (User, error) {
+	key := fmt.Sprintf("user_%d", userID)
+	item, err := memcacheClient.Get(key)
+	if err == nil {
+		var user User
+		if json.Unmarshal(item.Value, &user) == nil {
+			return user, nil
+		}
+	}
+	
+	// キャッシュにない場合はDBから取得
+	user := User{}
+	err = db.Get(&user, "SELECT * FROM users WHERE id = ?", userID)
+	if err != nil {
+		return user, err
+	}
+	
+	// キャッシュに保存
+	if data, err := json.Marshal(user); err == nil {
+		memcacheClient.Set(&memcache.Item{
+			Key:        key,
+			Value:      data,
+			Expiration: 3600, // 1時間
+		})
+	}
+	
+	return user, nil
+}
+
+func setCachedUser(user User) {
+	key := fmt.Sprintf("user_%d", user.ID)
+	if data, err := json.Marshal(user); err == nil {
+		memcacheClient.Set(&memcache.Item{
+			Key:        key,
+			Value:      data,
+			Expiration: 3600,
+		})
+	}
+}
+
+func deleteCachedUser(userID int) {
+	key := fmt.Sprintf("user_%d", userID)
+	memcacheClient.Delete(key)
+}
+
+type CachedPosts struct {
+	Posts     []Post    `json:"posts"`
+	CachedAt  time.Time `json:"cached_at"`
+}
+
+func getCachedIndexPosts() ([]Post, bool) {
+	key := "index_posts"
+	item, err := memcacheClient.Get(key)
+	if err != nil {
+		return nil, false
+	}
+	
+	var cached CachedPosts
+	if json.Unmarshal(item.Value, &cached) != nil {
+		return nil, false
+	}
+	
+	// 5分以内のキャッシュのみ有効
+	if time.Since(cached.CachedAt) > 5*time.Minute {
+		return nil, false
+	}
+	
+	return cached.Posts, true
+}
+
+func setCachedIndexPosts(posts []Post) {
+	key := "index_posts"
+	cached := CachedPosts{
+		Posts:    posts,
+		CachedAt: time.Now(),
+	}
+	
+	if data, err := json.Marshal(cached); err == nil {
+		memcacheClient.Set(&memcache.Item{
+			Key:        key,
+			Value:      data,
+			Expiration: 300, // 5分
+		})
+	}
+}
+
+func deleteCachedIndexPosts() {
+	memcacheClient.Delete("index_posts")
+}
+
+type UserStats struct {
+	CommentCount   int `json:"comment_count"`
+	PostCount      int `json:"post_count"`
+	CommentedCount int `json:"commented_count"`
+}
+
+func getCachedUserStats(userID int) (UserStats, bool) {
+	key := fmt.Sprintf("user_stats_%d", userID)
+	item, err := memcacheClient.Get(key)
+	if err != nil {
+		return UserStats{}, false
+	}
+	
+	var stats UserStats
+	if json.Unmarshal(item.Value, &stats) != nil {
+		return UserStats{}, false
+	}
+	
+	return stats, true
+}
+
+func setCachedUserStats(userID int, stats UserStats) {
+	key := fmt.Sprintf("user_stats_%d", userID)
+	if data, err := json.Marshal(stats); err == nil {
+		memcacheClient.Set(&memcache.Item{
+			Key:        key,
+			Value:      data,
+			Expiration: 1800, // 30分
+		})
+	}
+}
+
+func deleteCachedUserStats(userID int) {
+	key := fmt.Sprintf("user_stats_%d", userID)
+	memcacheClient.Delete(key)
+}
+
+func getCachedUserPosts(userID int) ([]Post, bool) {
+	key := fmt.Sprintf("user_posts_%d", userID)
+	item, err := memcacheClient.Get(key)
+	if err != nil {
+		return nil, false
+	}
+	
+	var cached CachedPosts
+	if json.Unmarshal(item.Value, &cached) != nil {
+		return nil, false
+	}
+	
+	// 10分以内のキャッシュのみ有効
+	if time.Since(cached.CachedAt) > 10*time.Minute {
+		return nil, false
+	}
+	
+	return cached.Posts, true
+}
+
+func setCachedUserPosts(userID int, posts []Post) {
+	key := fmt.Sprintf("user_posts_%d", userID)
+	cached := CachedPosts{
+		Posts:    posts,
+		CachedAt: time.Now(),
+	}
+	
+	if data, err := json.Marshal(cached); err == nil {
+		memcacheClient.Set(&memcache.Item{
+			Key:        key,
+			Value:      data,
+			Expiration: 600, // 10分
+		})
+	}
+}
+
+func deleteCachedUserPosts(userID int) {
+	key := fmt.Sprintf("user_posts_%d", userID)
+	memcacheClient.Delete(key)
+}
+
 func getSession(r *http.Request) *sessions.Session {
 	session, _ := store.Get(r, "isuconp-go.session")
 
@@ -155,17 +329,16 @@ func getSessionUser(r *http.Request) User {
 		}
 	}
 
-	u := User{}
-	err := db.Get(&u, "SELECT * FROM `users` WHERE `id` = ?", uid)
-	if err != nil {
-		return User{}
+	// memcachedからユーザー情報を取得
+	if user, err := getCachedUser(uid.(int)); err == nil {
+		// セッションにもキャッシュ
+		session.Values["user_cache"] = user
+		session.Save(r, nil)
+		return user
 	}
 
-	// セッションにユーザー情報をキャッシュ
-	session.Values["user_cache"] = u
-	session.Save(r, nil)
-
-	return u
+	// キャッシュにない場合は空のユーザーを返す（エラーログは出力済み）
+	return User{}
 }
 
 func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
@@ -391,6 +564,9 @@ func postLogin(w http.ResponseWriter, r *http.Request) {
 	u := tryLogin(r.FormValue("account_name"), r.FormValue("password"))
 
 	if u != nil {
+		// ログイン成功時にユーザー情報をキャッシュ
+		setCachedUser(*u)
+		
 		session := getSession(r)
 		session.Values["user_id"] = u.ID
 		session.Values["user_cache"] = *u
@@ -477,6 +653,9 @@ func postRegister(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:   time.Now(),
 	}
 	
+	// memcachedにもキャッシュを保存
+	setCachedUser(newUser)
+	
 	session.Values["user_id"] = uid
 	session.Values["user_cache"] = newUser
 	session.Values["csrf_token"] = secureRandomStr(16)
@@ -498,6 +677,17 @@ func getLogout(w http.ResponseWriter, r *http.Request) {
 func getIndex(w http.ResponseWriter, r *http.Request) {
 	me := getSessionUser(r)
 
+	// キャッシュから投稿を取得を試みる
+	if cachedPosts, found := getCachedIndexPosts(); found {
+		templates["index"].Execute(w, struct {
+			Posts     []Post
+			Me        User
+			CSRFToken string
+			Flash     string
+		}{cachedPosts, me, getCSRFToken(r), getFlash(w, r, "notice")})
+		return
+	}
+
 	results := []Post{}
 
 	err := db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC LIMIT ?", postsPerPage)
@@ -511,6 +701,9 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 		log.Print(err)
 		return
 	}
+
+	// 投稿をキャッシュに保存
+	setCachedIndexPosts(posts)
 
 	fmap := template.FuncMap{
 		"imageURL": imageURL,
@@ -544,38 +737,52 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	results := []Post{}
+	// ユーザー情報をキャッシュに保存
+	setCachedUser(user)
 
-	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC LIMIT ?", user.ID, postsPerPage)
-	if err != nil {
-		log.Print(err)
-		return
+	// キャッシュからユーザーの投稿を取得を試みる
+	var posts []Post
+	if cachedPosts, found := getCachedUserPosts(user.ID); found {
+		posts = cachedPosts
+	} else {
+		results := []Post{}
+		err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC LIMIT ?", user.ID, postsPerPage)
+		if err != nil {
+			log.Print(err)
+			return
+		}
+
+		posts, err = makePosts(results, getCSRFToken(r), false)
+		if err != nil {
+			log.Print(err)
+			return
+		}
+
+		// ユーザーの投稿をキャッシュに保存
+		setCachedUserPosts(user.ID, posts)
 	}
 
-	posts, err := makePosts(results, getCSRFToken(r), false)
-	if err != nil {
-		log.Print(err)
-		return
-	}
+	// キャッシュから統計情報を取得を試みる
+	var stats UserStats
+	if cachedStats, found := getCachedUserStats(user.ID); found {
+		stats = cachedStats
+	} else {
+		// 統計情報を一度のクエリで取得
+		statsQuery := `
+			SELECT 
+				(SELECT COUNT(*) FROM comments WHERE user_id = ?) as comment_count,
+				(SELECT COUNT(*) FROM posts WHERE user_id = ?) as post_count,
+				(SELECT COUNT(*) FROM comments WHERE post_id IN (SELECT id FROM posts WHERE user_id = ?)) as commented_count
+		`
+		
+		err = db.Get(&stats, statsQuery, user.ID, user.ID, user.ID)
+		if err != nil {
+			log.Print(err)
+			return
+		}
 
-	// 統計情報を一度のクエリで取得
-	var stats struct {
-		CommentCount   int `db:"comment_count"`
-		PostCount      int `db:"post_count"`
-		CommentedCount int `db:"commented_count"`
-	}
-	
-	statsQuery := `
-		SELECT 
-			(SELECT COUNT(*) FROM comments WHERE user_id = ?) as comment_count,
-			(SELECT COUNT(*) FROM posts WHERE user_id = ?) as post_count,
-			(SELECT COUNT(*) FROM comments WHERE post_id IN (SELECT id FROM posts WHERE user_id = ?)) as commented_count
-	`
-	
-	err = db.Get(&stats, statsQuery, user.ID, user.ID, user.ID)
-	if err != nil {
-		log.Print(err)
-		return
+		// 統計情報をキャッシュに保存
+		setCachedUserStats(user.ID, stats)
 	}
 
 	me := getSessionUser(r)
@@ -765,6 +972,11 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 新しい投稿が作成されたのでキャッシュを無効化
+	deleteCachedIndexPosts()
+	deleteCachedUserPosts(me.ID)
+	deleteCachedUserStats(me.ID)
+
 	http.Redirect(w, r, "/posts/"+strconv.FormatInt(pid, 10), http.StatusFound)
 }
 
@@ -823,6 +1035,16 @@ func postComment(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		log.Print(err)
 		return
+	}
+
+	// コメントが追加されたので関連するキャッシュを無効化
+	deleteCachedIndexPosts()
+	deleteCachedUserStats(me.ID)
+	
+	// 投稿者の統計情報も無効化（コメントされた数が変わる）
+	var post Post
+	if err := db.Get(&post, "SELECT user_id FROM posts WHERE id = ?", postID); err == nil {
+		deleteCachedUserStats(post.UserID)
 	}
 
 	http.Redirect(w, r, fmt.Sprintf("/posts/%d", postID), http.StatusFound)
@@ -884,7 +1106,16 @@ func postAdminBanned(w http.ResponseWriter, r *http.Request) {
 
 	for _, id := range r.Form["uid[]"] {
 		db.Exec(query, 1, id)
+		// BANされたユーザーのキャッシュを無効化
+		if userID, err := strconv.Atoi(id); err == nil {
+			deleteCachedUser(userID)
+			deleteCachedUserPosts(userID)
+			deleteCachedUserStats(userID)
+		}
 	}
+
+	// BANによってインデックスページの表示も変わる可能性があるため無効化
+	deleteCachedIndexPosts()
 
 	http.Redirect(w, r, "/admin/banned", http.StatusFound)
 }
