@@ -1185,7 +1185,13 @@ func saveImageToFile(postID int, mime string, data []byte) error {
 		ext = ".gif"
 	}
 
-	filename := fmt.Sprintf("../public/images/%d%s", postID, ext)
+	// ディレクトリが存在しない場合は作成
+	dir := "../public/images"
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+
+	filename := fmt.Sprintf("%s/%d%s", dir, postID, ext)
 	return os.WriteFile(filename, data, 0644)
 }
 
@@ -1208,13 +1214,16 @@ func imageFileExists(postID int, mime string) bool {
 func migrateImagesToFileSystem() {
 	log.Println("Migrating images to file system...")
 	
+	// すべての画像データを取得（LIMITを削除）
 	posts := []Post{}
-	err := db.Select(&posts, "SELECT id, mime, imgdata FROM posts WHERE imgdata IS NOT NULL LIMIT 1000")
+	err := db.Select(&posts, "SELECT id, mime, imgdata FROM posts WHERE imgdata IS NOT NULL")
 	if err != nil {
 		log.Print("Failed to select posts for migration:", err)
 		return
 	}
 
+	log.Printf("Found %d posts with image data to migrate", len(posts))
+	
 	migrated := 0
 	for _, post := range posts {
 		if !imageFileExists(post.ID, post.Mime) {
@@ -1223,11 +1232,14 @@ func migrateImagesToFileSystem() {
 				log.Printf("Failed to migrate image for post %d: %v", post.ID, err)
 			} else {
 				migrated++
+				if migrated%100 == 0 {
+					log.Printf("Migrated %d images so far...", migrated)
+				}
 			}
 		}
 	}
 	
-	log.Printf("Migrated %d images to file system", migrated)
+	log.Printf("Migration completed. Migrated %d images to file system", migrated)
 }
 
 func main() {
